@@ -3,7 +3,7 @@
 This repository contains my submission for the Sunbird AI Internship Assessment. The project is divided into two major sections:
 
 1. Python programming exercises solved using pytest.
-2. A Generative AI web application powered by the Sunbird AI APIs.
+2. A Generative AI web application powered by the Sunbird AI APIs.(https://huggingface.co/spaces/mariakawa/sunbird)
 
 ---
 
