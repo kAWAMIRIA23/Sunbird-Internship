@@ -1,17 +1,39 @@
-import os
+"""
+HTTP client for Sunbird AI APIs (STT, Sunflower, TTS).
+
+- Every HTTP call uses an explicit (connect, read) timeout.
+- No urllib3 automatic retries on POST (avoids retry storms).
+- No in-memory response caching (avoids stale / cross-request mix-ups on shared runtimes).
+"""
+
+from __future__ import annotations
+
+import logging
 import mimetypes
+import os
 import time
-from typing import Any, Dict
-from collections import OrderedDict
-import threading
+from typing import Any, Dict, Tuple
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+logger = logging.getLogger(__name__)
+
 
 class SunbirdApiError(Exception):
     """Raised when a Sunbird API request fails."""
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using default %s", name, raw, default)
+        return default
 
 
 class SunbirdClient:
@@ -19,50 +41,102 @@ class SunbirdClient:
 
     BASE_URL = "https://api.sunbird.ai"
 
-    def __init__(self, token: str | None = None, timeout_seconds: int = 120) -> None:
-        self.token = token or os.getenv("SUNBIRD_API_TOKEN")
+    def __init__(
+        self,
+        token: str | None = None,
+        connect_timeout: float | None = None,
+        read_timeout_llm: float | None = None,
+        read_timeout_stt: float | None = None,
+        read_timeout_tts: float | None = None,
+        read_timeout_download: float | None = None,
+    ) -> None:
+        raw = token or os.getenv("SUNBIRD_API_TOKEN")
+        self.token = raw.strip() if raw else None
         if not self.token:
             raise ValueError("Missing SUNBIRD_API_TOKEN. Add it to your environment or .env file.")
-        # Use a shorter default timeout to fail fast and reduce perceived slowness.
-        self.timeout_seconds = timeout_seconds
 
-        # Use a persistent Session to reuse TCP connections and enable connection pooling.
+        # Defaults tuned to fail fast; raise via env if your tenant needs longer reads.
+        self.connect_timeout = connect_timeout if connect_timeout is not None else _env_float(
+            "SUNBIRD_CONNECT_TIMEOUT", 10.0
+        )
+        self.read_timeout_llm = read_timeout_llm if read_timeout_llm is not None else _env_float(
+            "SUNBIRD_READ_TIMEOUT_LLM", 60.0
+        )
+        self.read_timeout_stt = read_timeout_stt if read_timeout_stt is not None else _env_float(
+            "SUNBIRD_READ_TIMEOUT_STT", 120.0
+        )
+        self.read_timeout_tts = read_timeout_tts if read_timeout_tts is not None else _env_float(
+            "SUNBIRD_READ_TIMEOUT_TTS", 60.0
+        )
+        self.read_timeout_download = (
+            read_timeout_download
+            if read_timeout_download is not None
+            else _env_float("SUNBIRD_READ_TIMEOUT_DOWNLOAD", 90.0)
+        )
+
         self.session = requests.Session()
-        # Set auth header on the session to avoid re-sending it per-request.
         self.session.headers.update({"Authorization": f"Bearer {self.token}"})
 
-        # Configure a HTTPAdapter with a small pool and retry strategy for transient errors.
-        retry_strategy = Retry(
-            total=3,
-            backoff_factor=1,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["HEAD", "GET", "OPTIONS", "POST"],
-        )
-        adapter = HTTPAdapter(pool_connections=10, pool_maxsize=10, max_retries=retry_strategy)
+        no_retries = Retry(total=0, connect=0, read=False, redirect=False)
+        adapter = HTTPAdapter(pool_connections=4, pool_maxsize=4, max_retries=no_retries)
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
 
-        # Simple in-memory caches to avoid repeated identical requests.
-        # Cache for sunflower_simple responses (instruction -> payload)
-        self._sunflower_cache: OrderedDict[str, Dict[str, Any]] = OrderedDict()
-        self._sunflower_cache_lock = threading.Lock()
-        self._sunflower_cache_max = 128
+    def _timeout(self, read_seconds: float) -> Tuple[float, float]:
+        return (self.connect_timeout, read_seconds)
 
-        # Cache for downloaded audio (audio_url -> bytes)
-        self._audio_cache: OrderedDict[str, bytes] = OrderedDict()
-        self._audio_cache_lock = threading.Lock()
-        self._audio_cache_max = 64
+    def _request_post(
+        self,
+        url: str,
+        *,
+        action: str,
+        read_timeout: float,
+        **kwargs: Any,
+    ) -> requests.Response:
+        timeout = self._timeout(read_timeout)
+        t0 = time.perf_counter()
+        logger.debug("%s POST %s timeout=%s", action, url, timeout)
+        try:
+            response = self.session.post(url, timeout=timeout, **kwargs)
+        except requests.exceptions.Timeout as exc:
+            raise SunbirdApiError(
+                f"{action} timed out after connect={self.connect_timeout}s read={read_timeout}s: {exc}"
+            ) from exc
+        except requests.exceptions.RequestException as exc:
+            raise SunbirdApiError(f"{action} request failed: {exc}") from exc
+        elapsed = time.perf_counter() - t0
+        logger.info("%s finished status=%s duration_sec=%.3f", action, response.status_code, elapsed)
+        return response
 
-    @property
-    def _headers(self) -> Dict[str, str]:
-        return {"Authorization": f"Bearer {self.token}"}
+    def _request_get(
+        self,
+        url: str,
+        *,
+        action: str,
+        read_timeout: float,
+        **kwargs: Any,
+    ) -> requests.Response:
+        timeout = self._timeout(read_timeout)
+        t0 = time.perf_counter()
+        logger.debug("%s GET %s timeout=%s", action, url, timeout)
+        try:
+            response = self.session.get(url, timeout=timeout, **kwargs)
+        except requests.exceptions.Timeout as exc:
+            raise SunbirdApiError(
+                f"{action} timed out after connect={self.connect_timeout}s read={read_timeout}s: {exc}"
+            ) from exc
+        except requests.exceptions.RequestException as exc:
+            raise SunbirdApiError(f"{action} request failed: {exc}") from exc
+        elapsed = time.perf_counter() - t0
+        logger.info("%s finished status=%s duration_sec=%.3f", action, response.status_code, elapsed)
+        return response
 
     def _raise_for_error(self, response: requests.Response, action: str) -> None:
         if response.ok:
             return
-        details = response.text
+        details = response.text[:2000] if response.text else ""
         raise SunbirdApiError(
-            f"{action} failed with status {response.status_code}. Response: {details}"
+            f"{action} failed with status {response.status_code}. Response (truncated): {details}"
         )
 
     def speech_to_text(self, audio_file_path: str) -> Dict[str, Any]:
@@ -73,15 +147,15 @@ class SunbirdClient:
             mime_type = "application/octet-stream"
         with open(audio_file_path, "rb") as audio_file:
             files = {"audio": (file_name, audio_file, mime_type)}
-            response = self.session.post(
+            response = self._request_post(
                 url,
+                action="STT",
+                read_timeout=self.read_timeout_stt,
                 files=files,
-                timeout=self.timeout_seconds,
             )
         self._raise_for_error(response, "Speech-to-text")
         payload = response.json()
 
-        # Sunbird STT can return either nested output.text or top-level audio_transcription.
         output = payload.get("output")
         if isinstance(output, dict) and isinstance(output.get("text"), str) and output["text"].strip():
             return output
@@ -99,24 +173,17 @@ class SunbirdClient:
     def sunflower_simple(
         self, instruction: str, model_type: str = "qwen", temperature: float = 0.2
     ) -> Dict[str, Any]:
+        """One POST per call; no client-side response cache."""
         url = f"{self.BASE_URL}/tasks/sunflower_simple"
-        # Check cache first (use a simple key derived from instruction+params).
-        key = f"{instruction}|{model_type}|{temperature}"
-        with self._sunflower_cache_lock:
-            cached = self._sunflower_cache.get(key)
-            if cached is not None:
-                # Move to end to mark as recently used
-                self._sunflower_cache.move_to_end(key)
-                return cached
-
-        response = self.session.post(
+        response = self._request_post(
             url,
+            action="Sunflower",
+            read_timeout=self.read_timeout_llm,
             data={
                 "instruction": instruction,
                 "model_type": model_type,
                 "temperature": temperature,
             },
-            timeout=self.timeout_seconds,
         )
         self._raise_for_error(response, "Sunflower simple inference")
         payload = response.json()
@@ -127,70 +194,37 @@ class SunbirdClient:
                 "Sunflower response missing both 'response' and 'output'. "
                 f"Payload: {payload}"
             )
-
-        # Store in cache (payload can be large, but we cap entries)
-        with self._sunflower_cache_lock:
-            self._sunflower_cache[key] = payload
-            if len(self._sunflower_cache) > self._sunflower_cache_max:
-                self._sunflower_cache.popitem(last=False)
         return payload
 
     def text_to_speech(self, text: str, speaker_id: int) -> Dict[str, Any]:
+        """Single TTS request (no retry loop — avoids duplicate synthesis and long hangs)."""
         url = f"{self.BASE_URL}/tasks/tts"
-        last_error_message = ""
-
-        for attempt in range(3):
-            try:
-                response = self.session.post(
-                    url,
-                    headers={"Content-Type": "application/json"},
-                    json={"text": text, "speaker_id": speaker_id},
-                    timeout=self.timeout_seconds,
-                )
-                self._raise_for_error(response, "Text-to-speech")
-                payload = response.json()
-                output = payload.get("output", {})
-                audio_url = output.get("audio_url") or output.get("audioUrl")
-                if audio_url:
-                    return output
-
-                service_error = output.get("Error") if isinstance(output, dict) else None
-                if service_error:
-                    last_error_message = str(service_error)
-                else:
-                    last_error_message = f"Text-to-speech returned no audio URL. Payload: {payload}"
-            except requests.exceptions.RequestException as exc:
-                last_error_message = str(exc)
-
-            # Retry on transient/network/provider-side failures.
-            if attempt < 2:
-                time.sleep(2 * (attempt + 1))
-
-        raise SunbirdApiError(
-            "Text-to-speech failed after retries. "
-            f"Last error: {last_error_message}"
+        response = self._request_post(
+            url,
+            action="TTS",
+            read_timeout=self.read_timeout_tts,
+            headers={"Content-Type": "application/json"},
+            json={"text": text, "speaker_id": speaker_id},
         )
+        self._raise_for_error(response, "Text-to-speech")
+        payload = response.json()
+        output = payload.get("output", {})
+        audio_url = output.get("audio_url") or output.get("audioUrl")
+        if not audio_url:
+            raise SunbirdApiError(f"Text-to-speech returned no audio URL. Payload: {payload}")
+        return output
 
     def download_audio(self, audio_url: str) -> bytes:
-        # Stream the download to avoid blocking the session while large files transfer.
-        # Check audio cache first
-        with self._audio_cache_lock:
-            cached_audio = self._audio_cache.get(audio_url)
-            if cached_audio is not None:
-                self._audio_cache.move_to_end(audio_url)
-                return cached_audio
-
-        response = self.session.get(audio_url, timeout=self.timeout_seconds, stream=True)
+        """Stream download; no cross-run audio cache."""
+        response = self._request_get(
+            audio_url,
+            action="Audio download",
+            read_timeout=self.read_timeout_download,
+            stream=True,
+        )
         self._raise_for_error(response, "Audio download")
         chunks = []
         for chunk in response.iter_content(chunk_size=8192):
             if chunk:
                 chunks.append(chunk)
-        data = b"".join(chunks)
-
-        with self._audio_cache_lock:
-            self._audio_cache[audio_url] = data
-            if len(self._audio_cache) > self._audio_cache_max:
-                self._audio_cache.popitem(last=False)
-
-        return data
+        return b"".join(chunks)
